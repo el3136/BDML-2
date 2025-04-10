@@ -9,7 +9,7 @@ from datasets import load_dataset
 from torch.distributed.tensor.parallel import parallelize_module
 import random
 
-# Argument Parsing for Tensor Parallel
+# Tensor Parallel
 rank  = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(rank)
 dist.init_process_group("nccl", world_size=2, rank=rank)
@@ -52,7 +52,7 @@ quant_config = BitsAndBytesConfig(
 model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quant_config).cuda(rank)
 
 # Tensor parallelism
-model = parallelize_module(model, parallel_mode="column", devices=[0, 1])
+model = parallelize_module(model, parallel_plan="column", devices=[0, 1])
 
 # Tokenizer setup
 tokenizer = AutoTokenizer.from_pretrained(model_name)

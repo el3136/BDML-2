@@ -17,6 +17,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_path = "/scratch/el3136/data-finetuned-llama"
 model_path = "/scratch/el3136/tensor-finetuned-llama"
 model_path = "/scratch/el3136/pipeline-finetuned-llama"
+model_path = "/scratch/el3136/your-finetuned-llama"
 model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 

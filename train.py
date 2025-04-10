@@ -3,9 +3,14 @@ import torch
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig
 )
-from peft import get_peft_model, LoraConfig, TaskType
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict
+from torch.utils.data import Dataset as TorchDataset
 import random
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Initialize the distributed environment
+dist.init_process_group("nccl", rank=int(os.environ['LOCAL_RANK']), world_size=2)
 
 # Define the directory containing txts
 directory = "/scratch/el3136/climate_text_dataset"
@@ -25,20 +30,34 @@ with open("/scratch/el3136/BDML-1/train_txt_files.txt", "w") as f:
 with open("/scratch/el3136/BDML-1/test_txt_files.txt", "w") as f:
     f.write("\n".join(test_sets))
 
-# Load training and testing text file paths
-with open("/scratch/el3136/BDML-1/train_txt_files.txt", "r") as f:
-    train_txt_files = f.read().splitlines()
-with open("/scratch/el3136/BDML-1/test_txt_files.txt", "r") as f:
-    test_txt_files = f.read().splitlines()
+# Custom Dataset class to load text files efficiently
+class TextFileDataset(TorchDataset):
+    def __init__(self, file_paths, tokenizer, max_length=512):
+        self.file_paths = file_paths
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-# Tells "trainer" that "train" is made up of the actual .txt files listed in train_txt_files
-train_dataset = load_dataset("text", data_files={"train": train_txt_files})["train"]
-eval_dataset = load_dataset("text", data_files={"test": test_txt_files})["test"]
+    def __len__(self):
+        return len(self.file_paths)
 
-# ================== TRAINING STEP ==================
+    def __getitem__(self, idx):
+        # Open file on-the-fly
+        file_path = self.file_paths[idx]
+        with open(file_path, "r") as f:
+            text = f.read()
 
-# Define model path
-model_name = "/scratch/el3136/Llama3.2-3B/"
+        # Tokenize text
+        tokenized = self.tokenizer(
+            text,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+        )
+        tokenized["labels"] = tokenized["input_ids"]
+        return tokenized
+
+# Load the tokenizer and model
+model_name = "meta-llama/Llama-3B"  # Use Hugging Face's Llama-3B model
 
 # Enable 4-bit quantization
 quantization_config = BitsAndBytesConfig(
@@ -55,46 +74,18 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
 
-# Tokenization function
-def tokenize_function(example):
-    # Here, we set `labels` to be the same as `input_ids` in causal LM
-    tokenized = tokenizer(
-        example["text"][0],
-        truncation=False,
-        # example["text"],
-        # truncation=True,
-        padding="max_length",
-        max_length=512,
-    )
-    tokenized["labels"] = tokenized["input_ids"]
-    return tokenized
+# Create datasets with the custom dataset class
+train_dataset = TextFileDataset(train_sets, tokenizer)
+eval_dataset = TextFileDataset(test_sets, tokenizer)
 
-# Apply tokenization
-train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-eval_dataset = eval_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+# ================== DISTRIBUTED DATA PARALLELISM (DDP) ==================
 
-# Enable gradient checkpointing for memory optimization
-model.gradient_checkpointing_enable()
+# Set the model to the appropriate device for the rank
+device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+model = model.to(device)
 
-# Define LoRA configuration
-lora_config = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=8,
-    lora_alpha=32,
-    lora_dropout=0.1,
-    target_modules=["q_proj", "v_proj"],
-    bias="none"
-)
-
-# Apply LoRA
-lora_model = get_peft_model(model, lora_config)
-
-# Ensure that only float-type parameters require gradients
-for param in lora_model.parameters():
-    if param.dtype in [torch.float32, torch.float16, torch.float64]:  # Check for float-type parameters
-        param.requires_grad = True 
-
-lora_model.print_trainable_parameters()
+# Apply DistributedDataParallel (DDP)
+model = DDP(model, device_ids=[int(os.environ['LOCAL_RANK'])])
 
 # Define training arguments
 training_args = TrainingArguments(
@@ -102,20 +93,20 @@ training_args = TrainingArguments(
     per_device_train_batch_size=2,
     gradient_accumulation_steps=8,
     optim="adamw_torch",
-    fp16=True,
-    bf16=False,
+    fp16=False,           # Set fp16=False as per your requirement
+    bf16=True,            # Enable bf16 for hardware optimization
     logging_steps=10,
     save_steps=500,
     save_total_limit=3,
     evaluation_strategy="steps",
     eval_steps=100,
     load_best_model_at_end=True,
-    remove_unused_columns=False,  # prevent dropping required PeftModelForCausalLM fields
+    remove_unused_columns=False,  # prevent dropping required fields
 )
 
 # Define Trainer
 trainer = Trainer(
-    model=lora_model,
+    model=model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
